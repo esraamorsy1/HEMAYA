@@ -18,15 +18,15 @@ from rule_engine import (
     PersonFrameInput,
 )
 
-from nlp_report import summarize_worker_log, generate_report
+from nlp_report import summarize_worker_log, generate_report, report_to_pdf_bytes
 
 # ===============================
 # Model Paths
 # ===============================
 
-FALL_MODEL_PATH = "D:\\HEMAYA\\best_fall.pt"
-PPE_MODEL_PATH = "D:\\HEMAYA\\ppe.pt"
-GOGGLES_MODEL_PATH = "D:\\HEMAYA\\best_Googles.pt"
+FALL_MODEL_PATH = "C:/Users/20100/Hemaya/models/fall_detection_best.pt"
+PPE_MODEL_PATH = "C:/Users/20100/Hemaya/models/PPE_best.pt"
+GOGGLES_MODEL_PATH = "C:/Users/20100/Hemaya/models/goggles_best.pt"
 
 # ===============================
 # Class Index Map
@@ -143,9 +143,9 @@ def draw_worker_box(frame, box, worker_id, has_violation, has_alert):
     x1, y1, x2, y2 = map(int, box)
 
     if has_alert:
-        color = (97, 105, 255)    # light red / salmon
+        color = (0, 0, 255)       # solid red - critical fall alert
     elif has_violation:
-        color = (71, 179, 255)    # light orange
+        color = (0, 0, 255)       # solid red - missing PPE / violation
     else:
         color = (144, 238, 144)   # light green
 
@@ -733,11 +733,11 @@ if uploaded_file is not None:
 
                             if e.violations:
                                 text = ", ".join(e.violations)
-                                consumed = draw_label(output, box[0], y_cursor, text, color=(71, 179, 255))
+                                consumed = draw_label(output, box[0], y_cursor, text, color=(0, 0, 255))
                                 y_cursor += consumed
 
                             if e.alert and e.alert_message:
-                                draw_label(output, box[0], y_cursor, "ALERT: SUSTAINED FALL", color=(97, 105, 255))
+                                draw_label(output, box[0], y_cursor, "ALERT: SUSTAINED FALL", color=(0, 0, 255))
 
                         last_output = output
                         last_evaluations = evaluations
@@ -850,10 +850,26 @@ if uploaded_file is not None:
 
             lang_label = "Arabic" if report_language == "ar" else "English"
             st.success(f"✅ Report ready ({lang_label}) — click below to download.")
-            st.download_button(
-                f"⬇️ Download Report ({lang_label})",
-                data=last_report["content"].encode("utf-8"),
-                file_name=f"hemaya_safety_report_{report_language}_{file_date}.md",
-                mime="text/markdown",
-                key=f"download_{report_language}",
-            )
+
+            try:
+                pdf_bytes = report_to_pdf_bytes(last_report["content"], report_language)
+                st.download_button(
+                    f"⬇️ Download Report ({lang_label} PDF)",
+                    data=pdf_bytes,
+                    file_name=f"hemaya_safety_report_{report_language}_{file_date}.pdf",
+                    mime="application/pdf",
+                    key=f"download_pdf_{report_language}",
+                )
+            except Exception as exc:
+                st.error(f"تعذّر إنشاء ملف الـ PDF: {exc}")
+                st.caption(
+                    "لو المشكلة إن مكتبات العربي مش متثبتة، شغّلي: "
+                    "pip install arabic-reshaper python-bidi"
+                )
+                st.download_button(
+                    f"⬇️ Download Report ({lang_label} Markdown)",
+                    data=last_report["content"].encode("utf-8"),
+                    file_name=f"hemaya_safety_report_{report_language}_{file_date}.md",
+                    mime="text/markdown",
+                    key=f"download_md_{report_language}",
+                )
