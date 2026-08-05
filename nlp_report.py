@@ -23,6 +23,8 @@ alert, alert_message) — وهي بتيجي فريم فريم لكل عامل �
 
 import os
 import csv
+import io
+import re
 import json
 from collections import defaultdict
 from dataclasses import asdict, is_dataclass
@@ -30,6 +32,16 @@ from datetime import datetime
 from typing import Dict
 
 from google import genai
+
+# اختياريين: لازمين بس عشان نطلع PDF عربي متظبط (ربط الحروف + اتجاه RTL).
+# لو مش متثبتين، لسه ممكن نطلع PDF إنجليزي عادي، لكن العربي هيبان حروف
+# منفصلة/بالعكس -- عشان كده لازم:  pip install arabic-reshaper python-bidi
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display as _bidi_get_display
+    _ARABIC_SHAPING_AVAILABLE = True
+except ImportError:
+    _ARABIC_SHAPING_AVAILABLE = False
 
 # ممكن تستبدليه بأي موديل تاني متاح عندك (مثلاً "gemini-2.0-flash")
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -394,3 +406,187 @@ def generate_report(
     raw_text = response.text or ""
 
     return {"content": raw_text.strip(), "language": language, "raw": raw_text}
+
+
+# ----------------------------------------------------------------------
+# 5) تحويل نص التقرير لملف PDF فعلي (عربي RTL + إنجليزي)
+# ----------------------------------------------------------------------
+# ملحوظة تثبيت: عشان العربي يتربط ويظهر صح لازم:
+#     pip install arabic-reshaper python-bidi
+# لو الاتنين دول مش متثبتين، الدالة لسه هتشتغل للإنجليزي عادي، لكن هترمي
+# Error واضح لو حد طلب تقرير عربي بـ PDF من غيرهم.
+
+_REPORT_FONT_NAME = "HemayaReportFont"
+_REPORT_FONT_NAME_BOLD = "HemayaReportFont-Bold"
+_report_font_path_cache: str | None = None
+
+
+def _find_report_font_path() -> str | None:
+    """
+    بتدور على أول خط TTF موجود فعليًا على الجهاز وبيدعم حروف عربي كاملة
+    (مش بس لاتيني)، عشان نسجّله في reportlab. بتفضّل خطوط ويندوز (Tahoma/
+    Arial/Segoe UI) لأن السيرفر هنا شغال على ويندوز أصلاً (زي ما واضح من
+    مسارات الموديلات D:\\HEMAYA)، وبعدين بتجرب مسارات لينكس/ماك احتياطًا،
+    وبعدين خط جوه مجلد المشروع نفسه (fonts/) لو حد حط واحد يدوي.
+
+    ممكن كمان تحددي مسار الخط بنفسك عن طريق متغير بيئة HEMAYA_REPORT_FONT.
+    """
+    global _report_font_path_cache
+    if _report_font_path_cache:
+        return _report_font_path_cache
+
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+
+    candidates = [
+        os.environ.get("HEMAYA_REPORT_FONT"),
+        os.path.join(windir, "Fonts", "tahoma.ttf"),
+        os.path.join(windir, "Fonts", "arial.ttf"),
+        os.path.join(windir, "Fonts", "segoeui.ttf"),
+        os.path.join(project_dir, "fonts", "NotoNaskhArabic-Regular.ttf"),
+        os.path.join(project_dir, "fonts", "Tahoma.ttf"),
+        "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Geeza Pro.ttc",
+    ]
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            _report_font_path_cache = path
+            return path
+    return None
+
+
+def _register_report_font() -> str:
+    """بتسجّل خط PDF (نفسه للعادي والبولد، تبسيطًا) وترجع اسمه، أو ترمي
+    RuntimeError واضح لو معرفتش تلاقي خط مناسب على الجهاز."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    if _REPORT_FONT_NAME in pdfmetrics.getRegisteredFontNames():
+        return _REPORT_FONT_NAME
+
+    font_path = _find_report_font_path()
+    if not font_path:
+        raise RuntimeError(
+            "معنديش خط يدعم العربي عشان أطلع بيه PDF. اتأكدي إن ويندوز "
+            "فونتس متاحة (Tahoma/Arial)، أو حطي خط زي NotoNaskhArabic-"
+            "Regular.ttf في مجلد fonts/ جنب nlp_report.py، أو حددي المسار "
+            "في متغير البيئة HEMAYA_REPORT_FONT."
+        )
+
+    pdfmetrics.registerFont(TTFont(_REPORT_FONT_NAME, font_path))
+    # بنسجل نفس الخط تحت اسم "بولد" كمان (تبسيطًا -- مفيش وزن بولد حقيقي
+    # مضمون وجوده لكل الخطوط اللي بنجرّبها)، عشان أي <b> جوه الفقرة الإنجليزية
+    # ماتفشلش.
+    pdfmetrics.registerFont(TTFont(_REPORT_FONT_NAME_BOLD, font_path))
+    return _REPORT_FONT_NAME
+
+
+def _escape_xml(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _prepare_line_text(text: str, language: str) -> str:
+    """
+    بتجهّز سطر واحد عشان يتحط جوه reportlab Paragraph:
+      - إنجليزي: بتحول **bold** لـ <b>bold</b> عادي.
+      - عربي: بتشيل ** (من غير ما تحولها لـ <b>، عشان تاج XML ممكن يتقلب
+        مكانه لما نطبّق bidi reordering)، وبعدين بتربط الحروف (reshape)
+        وترتبها بصريًا من اليمين للشمال (bidi) قبل ما تتحط في الفقرة.
+    """
+    text = _escape_xml(text.strip())
+
+    if language == "ar":
+        text = text.replace("**", "")
+        if _ARABIC_SHAPING_AVAILABLE:
+            text = _bidi_get_display(arabic_reshaper.reshape(text))
+        return text
+
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    return text
+
+
+def report_to_pdf_bytes(content: str, language: str = "ar") -> bytes:
+    """
+    بتحول نص التقرير (اللي طالع من generate_report، أو أي نص تاني) لملف
+    PDF حقيقي (bytes جاهزة للتحميل مباشرة من Streamlit عبر st.download_button).
+
+    بتدعم اللغتين في نفس الدالة:
+      - "ar": اتجاه الصفحة RTL بالكامل (محاذاة يمين + ترقيم/تعداد نقطي
+        على اليمين)، مع ربط الحروف العربي صح (عن طريق arabic-reshaper +
+        python-bidi لو متثبتين).
+      - "en": اتجاه LTR عادي، مع دعم **bold** من نص Gemini.
+
+    بتتعرف تلقائيًا على العناوين (#, ##, ###) والنقط (- أو *) في نص
+    التقرير وتنسقها كعناوين/تعداد نقطي بدل ما تطلع كلها كنص عادي.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT, TA_LEFT
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+
+    font_name = _register_report_font()
+    is_ar = language == "ar"
+    align = TA_RIGHT if is_ar else TA_LEFT
+
+    styles = {
+        "title": ParagraphStyle(
+            "HemayaTitle", fontName=font_name, fontSize=17, leading=23,
+            alignment=align, spaceAfter=16, textColor="#12305c",
+        ),
+        "heading": ParagraphStyle(
+            "HemayaHeading", fontName=font_name, fontSize=13, leading=18,
+            alignment=align, spaceBefore=12, spaceAfter=6, textColor="#1a3a6b",
+        ),
+        "body": ParagraphStyle(
+            "HemayaBody", fontName=font_name, fontSize=10.5, leading=16,
+            alignment=align, spaceAfter=6,
+        ),
+        "bullet": ParagraphStyle(
+            "HemayaBullet", fontName=font_name, fontSize=10.5, leading=16,
+            alignment=align, spaceAfter=4,
+            leftIndent=0 if is_ar else 14,
+            rightIndent=14 if is_ar else 0,
+        ),
+    }
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=2.2 * cm,
+        bottomMargin=2 * cm,
+        leftMargin=2 * cm,
+        rightMargin=2 * cm,
+        title="HEMAYA Safety Report",
+    )
+
+    story = []
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+
+        if not stripped:
+            story.append(Spacer(1, 6))
+            continue
+
+        if stripped.startswith("### "):
+            style_key, text = "heading", stripped[4:]
+        elif stripped.startswith("## "):
+            style_key, text = "heading", stripped[3:]
+        elif stripped.startswith("# "):
+            style_key, text = "title", stripped[2:]
+        elif stripped.startswith(("- ", "* ")):
+            bullet_body = stripped[2:].strip()
+            text = f"{bullet_body}  •" if is_ar else f"•  {bullet_body}"
+            style_key = "bullet"
+        else:
+            style_key, text = "body", stripped
+
+        story.append(Paragraph(_prepare_line_text(text, language), styles[style_key]))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
